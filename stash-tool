@@ -1,0 +1,222 @@
+#!/bin/bash
+# stash-tool --- interact with Atlassian Stash/Bitbucket from the commandline.
+#
+# Copyright (C) 2020 Per Andersson <avtobiff@foo.nu>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License,
+# or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Originally written by Per Andersson.
+
+set -e
+set -o pipefail
+
+
+# FIXME move to $HOME/.stash-tool.conf
+STASH_BASE_URL=""
+STASH_USER=
+STASH_PR_LIMIT=1000
+PROJECT=
+REPOSITORY=
+
+STASH_API_URL="$STASH_BASE_URL/rest/api/1.0"
+STASH_REPO_URL="$STASH_API_URL/projects/$PROJECT/repos/$REPOSITORY"
+
+
+usage() {
+    echo "stash-tool [CMD...]"
+    echo
+    echo "    create-pr [topic-branch] <merge-branch>"
+    echo "                          create a pull request from current branch, or named"
+    echo "                          topic-branch, which should merge to <merge-branch>."
+    echo
+    echo "    create-prs [topic-branch] <merge-branch> <branches...>"
+    echo "                          NOT IMPLEMENTED YET"
+    echo "                          create several pull requests using current branch,"
+    echo "                          or named topic-branch, as template. Use <merge-branch>"
+    echo "                          to figure out what commits to cherry-pick onto"
+    echo "                          <branches...>."
+    echo
+    echo "    merge [id]            merge pull request by id"
+    echo
+    echo "    pull-requests         lists pull requests created by the user"
+}
+
+
+create_pr() {
+    # merge-branch not empty, topic-branch supplied from cmdline
+    if [ x"$3" != "x" ]; then
+        create_prs $@
+    elif [ x"$2" != "x" ]; then
+        topic_branch="$1"
+        merge_branch="$2"
+    # merge-branch empty, get topic-branch from git.
+    else
+        topic_branch="$(git branch --show-current)"
+        merge_branch="$1"
+    fi
+
+    if [ x"$merge_branch" = "x" ]; then
+        echo "No merge-branch supplied..."
+        exit 1
+    fi
+
+    ticket="$(echo $topic_branch | sed 's/^.*\///' | cut -d- -f1-2)"
+    subject="$(echo $topic_branch | sed 's/^.*\///' | cut -d- -f3- | sed 's/-/ /g')"
+
+    title="$ticket: $subject"
+    description="$(git log --format=%B -1 | sed ':a;N;$!ba;s/\n/\\n/g')"
+
+    pull_request_payload="
+{
+    \"title\": \"$title\",
+    \"description\": \"$description\",
+    \"state\": \"OPEN\",
+    \"open\": true,
+    \"closed\": false,
+    \"fromRef\": {
+        \"id\": \"refs/heads/$topic_branch\",
+        \"repository\": {
+            \"slug\": \"$REPOSITORY\",
+            \"name\": null,
+            \"project\": {
+                \"key\": \"$PROJECT\"
+            }
+        }
+    },
+    \"toRef\": {
+        \"id\": \"refs/heads/$merge_branch\",
+        \"repository\": {
+            \"slug\": \"$REPOSITORY\",
+            \"name\": null,
+            \"project\": {
+                \"key\": \"$PROJECT\"
+            }
+        }
+    },
+    \"locked\": false
+}
+"
+
+    git push origin $topic_branch
+
+    printf "Stash password for $STASH_USER: "
+    read -s PASSWORD
+    echo
+
+    new_pr_id="$(curl -su "$STASH_USER:$PASSWORD" \
+                      -X POST --data "$pull_request_payload" \
+                      -H "X-Atlassian-Token: no-check" \
+                      -H "Content-type: application/json" \
+                      $STASH_REPO_URL/pull-requests \
+                 | jq '.id')"
+
+    echo "Created new pull request with id $new_pr_id"
+}
+
+create_prs() {
+    # TODO create several pull requests: cherry-pick commits, create branches,
+    # create prs
+    echo $@
+    exit 0
+}
+
+
+pull_requests() {
+    printf "Stash password for $STASH_USER: "
+    read -s PASSWORD
+    echo
+
+    # list created pull requests
+    pull_requests=$(curl -su "$STASH_USER:$PASSWORD" \
+                         "$STASH_REPO_URL/pull-requests?limit=$STASH_PR_LIMIT" \
+                    | jq -r --arg U "$STASH_USER" \
+                         '.values[] | select(.author.user.name==$U)')
+
+    # emit pr_id, approval, title
+    echo "$pull_requests" \
+    | jq '[(.id | tostring |
+            (length | if . >= 5 then "" else " " * (5 - .) end) as $pad
+                | "\($pad)\(.)"),
+           .title,
+           (if any(.reviewers[]; .approved==true) then
+                "APPROVED"
+            else
+                "        "
+            end)]
+          | "\(.[0])  \(.[2])  \(.[1])"' \
+    | sed 's/^"\(.*\)"$/\1/g'
+}
+
+
+merge() {
+    printf "Stash password for $STASH_USER: "
+    read -s PASSWORD
+    echo
+
+    pr_id="$1"
+
+    # check if we can merge
+    can_merge="$(curl -su "$STASH_USER:$PASSWORD" \
+                 "$STASH_REPO_URL/pull-requests/$pr_id/merge" \
+                 | jq '.canMerge')"
+    pr_title="$(curl -su "$STASH_USER:$PASSWORD" \
+                     "$STASH_REPO_URL/pull-requests/$pr_id" \
+                | jq '.title')"
+    pr_version="$(curl -su "$STASH_USER:$PASSWORD" \
+                     "$STASH_REPO_URL/pull-requests/$pr_id" \
+                 | jq '.version')"
+
+    if [ "true" != "$can_merge" ]; then
+        echo "Can't merge $pr_title"
+        exit 1
+    fi
+
+    echo "Can merge $pr_title"
+    printf "Merge $pr_id? [Y/n] "
+    read merge
+
+    if [ "y" = "$merge" -o "Y" = "$merge" -o "x" = x"$merge" ]; then
+        echo "Merging $pr_title..."
+        merged="$(curl -su "$STASH_USER:$PASSWORD" \
+                       -X POST \
+                       -H "X-Atlassian-Token: no-check" \
+                       "$STASH_REPO_URL/pull-requests/$pr_id/merge?version=$pr_version" \
+                  | jq '.state')"
+        echo "$merged"
+    else
+        echo "Aborting merge of $pr_title"
+    fi
+}
+
+
+case "$1" in
+    c|create-pr)
+        shift
+        create_pr $@
+        ;;
+    h|help)
+        usage
+        exit 0
+        ;;
+    m|merge)
+        merge $2
+        ;;
+    pr|pull-requests)
+        pull_requests
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac;
