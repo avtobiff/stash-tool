@@ -22,6 +22,9 @@ set -e
 set -o pipefail
 
 
+CFG_DIR="$HOME/.config/stash-tool"
+
+
 # FIXME move to $HOME/.stash-tool.conf
 STASH_BASE_URL=""
 STASH_USER=
@@ -41,11 +44,13 @@ usage() {
     echo "                          topic-branch, which should merge to <merge-branch>."
     echo
     echo "    create-prs [topic-branch] <merge-branch> <branches...>"
-    echo "                          NOT IMPLEMENTED YET"
     echo "                          create several pull requests using current branch,"
     echo "                          or named topic-branch, as template. Use <merge-branch>"
     echo "                          to figure out what commits to cherry-pick onto"
-    echo "                          <branches...>."
+    echo "                          <branches...>. The file "
+    echo "                          \$HOME/.config/stash-tool/backport-branches can be used"
+    echo "                          to configure branches to backport to if omitted from"
+    echo "                          command line."
     echo
     echo "    merge [id]            merge pull request by id"
     echo
@@ -54,13 +59,11 @@ usage() {
 
 
 create_pr() {
-    # merge-branch not empty, topic-branch supplied from cmdline
-    if [ x"$3" != "x" ]; then
-        create_prs $@
-    elif [ x"$2" != "x" ]; then
+    # topic-branch supplied from cmdline
+    if [ x"$2" != "x" ]; then
         topic_branch="$1"
         merge_branch="$2"
-    # merge-branch empty, get topic-branch from git.
+    # get topic-branch from git.
     else
         topic_branch="$(git branch --show-current)"
         merge_branch="$1"
@@ -125,10 +128,67 @@ create_pr() {
 }
 
 create_prs() {
-    # TODO create several pull requests: cherry-pick commits, create branches,
-    # create prs
-    echo $@
-    exit 0
+    # Create several pull requests, example usage backporting to maint branches.
+    # Use "$HOME/.config/stash-tool/backport-branches" file for branches to
+    # backport to. Format is one branch name per line, lines beginning with
+    # hash (#) is ignored. These branch names will be appended to the backport
+    # pr branches.
+
+    # merge-branch is the one the work is based on initally, e.g. main.
+    if [ x"$2" != "x" ]; then
+        prs_topic_branch="$1"
+        prs_merge_branch="$2"
+        shift
+    # merge-branch empty, get topic-branch from git.
+    else
+        prs_topic_branch="$(git branch --show-current)"
+        prs_merge_branch="$1"
+    fi
+
+
+    if [ x"$prs_merge_branch" = "x" ]; then
+        echo "No merge-branch supplied..."
+        exit 1
+    fi
+
+    if [ "$prs_merge_branch" = "$prs_topic_branch" ]; then
+        echo "merge-branch is same as topic-branch"
+        exit 1
+    fi
+
+    # pop merge_branch arg from commandline args
+    shift
+
+    # backport branches supplied
+    if [ x"$1" != "x" ]; then
+        backport_branches="$@"
+    else
+        backport_branches="$(grep -v "^#" $CFG_DIR/backport-branches)"
+    fi
+
+    # find commits to cherry-pick commits
+    merge_base="$(git merge-base "$prs_merge_branch" "$prs_topic_branch")"
+    commits="$(git log --oneline "$prs_merge_branch..$prs_topic_branch" \
+               | awk '{print $1}')"
+
+    # create branches,
+    for bp_branch in $backport_branches; do
+        git checkout "$prs_topic_branch"
+        bp_topic_branch="$prs_topic_branch-$bp_branch"
+        git checkout -b "$bp_topic_branch" "$bp_branch" || {
+            echo "failed checkout $bp_topic_branch"
+            exit 1
+        }
+        git cherry-pick -x $commits || {
+            echo "failed cherry-pick $commits"
+            exit 1
+        }
+
+        # create pr
+        create_pr "$bp_topic_branch" "$bp_branch"
+    done
+
+    git checkout "$prs_topic_branch"
 }
 
 
@@ -205,6 +265,10 @@ case "$1" in
         shift
         create_pr $@
         ;;
+    cs|create-prs)
+        shift
+        create_prs $@
+        ;;
     h|help)
         usage
         exit 0
@@ -212,7 +276,7 @@ case "$1" in
     m|merge)
         merge $2
         ;;
-    pr|pull-requests)
+    pr|prs|pull-requests)
         pull_requests
         ;;
     *)
