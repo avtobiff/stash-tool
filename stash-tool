@@ -1,7 +1,7 @@
 #!/bin/bash
 # stash-tool --- interact with Atlassian Stash/Bitbucket from the commandline.
 #
-# Copyright (C) 2020 Per Andersson <avtobiff@foo.nu>
+# Copyright (C) 2020-2021 Per Andersson <avtobiff@foo.nu>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
